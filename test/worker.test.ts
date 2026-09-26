@@ -163,6 +163,21 @@ describe('on-demand cache', () => {
     expect((await request()).status).toBe(200);
     expect(calls).toBe(2);
   });
+  it('allows a new fetch after a legacy global 403 cooldown expires', async () => {
+    await runInDurableObject(stub(), async (_instance, state) => {
+      await state.storage.put('control', { day: new Date().toISOString().slice(0, 10), attempts: 1,
+        blockedUntil: Date.now() + 60_000, blockedReason: 'production_forbidden' });
+    });
+    expect(await (await request()).json()).toMatchObject({ error: { code: 'production_forbidden' } });
+    expect(calls).toBe(0);
+    await runInDurableObject(stub(), async (_instance, state) => {
+      await state.storage.put('control', { day: new Date().toISOString().slice(0, 10), attempts: 1,
+        blockedUntil: Date.now() - 1, blockedReason: 'production_forbidden' });
+    });
+    upstream(1, 200, pageBody(1, 1));
+    expect((await request()).status).toBe(200);
+    expect(calls).toBe(1);
+  });
   it('counts failed attempts and retries of a server error', async () => {
     upstream(1, 500); upstream(1, 200, pageBody(1, 1));
     expect((await request()).status).toBe(200);
