@@ -7,7 +7,7 @@ Deployment version: see `npx wrangler deployments status`.
 
 For Flutter client setup, see [APP_INTEGRATION.md](APP_INTEGRATION.md).
 
-Deployment verification: 32 tests and TypeScript checks passed locally. The expanded live sandbox snapshot published 318 unique wallpapers across 16 pages; its page size is 20 because the sandbox clamps the requested 100. Authenticated production fetching and real Postgres connectivity remain unverified until the secret and Hyperdrive configuration are supplied.
+Deployment verification: 33 tests and TypeScript checks passed locally. The expanded live sandbox snapshot published 318 unique wallpapers across 16 pages; its page size is 20 because the sandbox clamps the requested 100. Its refresh log recorded 16 sandbox attempts and a durable daily count moving from 10 to 26. Authenticated production fetching and real Postgres connectivity remain unverified until the secret and Hyperdrive configuration are supplied.
 
 ## Development and deployment
 

@@ -54,7 +54,9 @@ async function serve(request: Request, env: Env, ctx: ExecutionContext): Promise
   const manifest = await cached<Manifest>(request, 'manifest', env, ctx, () => coordinator(env).manifest());
   if (!manifest) throw new ServiceError('cache_unavailable');
   const now = Date.now();
-  if (manifest.current.expiresAt <= now) throw new ServiceError('cache_expired');
+  if (manifest.current.expiresAt <= now) {
+    throw new ServiceError(version ? 'snapshot_expired' : 'cache_expired', version ? 410 : 503);
+  }
   const ref = !version || version === manifest.current.version ? manifest.current
     : version === manifest.previous?.version ? manifest.previous : null;
   if (!ref || ref.availableUntil <= now || ref.expiresAt <= now) throw new ServiceError('snapshot_expired', 410);

@@ -86,6 +86,12 @@ describe('cache-only app endpoint', () => {
     await seed(true); const r = await request(); expect(r.status).toBe(503);
     expect(await r.json()).toMatchObject({ error: { code: 'cache_expired' } });
   });
+  it('returns 410 for an explicitly requested expired snapshot', async () => {
+    const old = await seed(true);
+    const r = await request(`?page=2&snapshot=${old.version}`);
+    expect(r.status).toBe(410);
+    expect(await r.json()).toMatchObject({ error: { code: 'snapshot_expired' } });
+  });
   it('rejects an unknown version instead of switching snapshots', async () => {
     await seed(); expect((await request(`?snapshot=${crypto.randomUUID()}`)).status).toBe(410);
   });
