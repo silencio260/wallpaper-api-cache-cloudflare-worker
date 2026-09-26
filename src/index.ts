@@ -1,6 +1,6 @@
 import type { RefreshCoordinator, PageResult } from './coordinator';
 import { checkDatabase } from './database';
-import { COORDINATOR_NAME, PAGE_SIZE, ServiceError, type CachedPage } from './model';
+import { COORDINATOR_NAME, PAGE_SIZE, ServiceError, object, type CachedPage } from './model';
 export { RefreshCoordinator } from './coordinator';
 
 export interface Env {
@@ -65,9 +65,23 @@ async function serve(request: Request, env: Env, ctx: ExecutionContext): Promise
   const cached: CachedPage = result.page;
   const blocked = new Set(env.BLOCKED_WALLPAPER_IDS.split(',').map(id => id.trim()).filter(Boolean));
   const items = cached.items.filter(item => !blocked.has(String(item.id)));
+  const observed = new Map<number, string>();
+  for (const item of items) {
+    const candidates = [item.category, ...(Array.isArray(item.categories) ? item.categories : [])];
+    for (const candidate of candidates) {
+      if (!object(candidate) || candidate.is_premium !== false) continue;
+      const id = Number(candidate.id);
+      if (!Number.isSafeInteger(id) || id < 1 || typeof candidate.name !== 'string') continue;
+      observed.set(id, CATEGORY_NAMES[id] ?? candidate.name);
+    }
+  }
+  const categories = [...observed].sort(([a], [b]) => {
+    const ia = CATEGORY_ORDER.indexOf(a), ib = CATEGORY_ORDER.indexOf(b);
+    return (ia < 0 ? Number.MAX_SAFE_INTEGER : ia) - (ib < 0 ? Number.MAX_SAFE_INTEGER : ib) || a - b;
+  }).map(([id, name]) => ({ id, name }));
   const response = json({
     data: items,
-    categories: CATEGORY_ORDER.map(id => ({ id, name: CATEGORY_NAMES[id] })),
+    categories,
     selected_category_id: categoryId,
     pagination: { current_page: page, per_page: cached.pageSize, requested_per_page: PAGE_SIZE,
       last_page: cached.lastPage, total: cached.total, has_more: page < cached.lastPage,
@@ -95,11 +109,14 @@ export default {
       const code = known ? error.code : 'service_error', status = known ? error.status : 503;
       const retry = status === 429 && code !== 'rate_limited'
         ? String(Math.ceil((nextUTC(Date.now()) - Date.now()) / 1000)) : status === 503 ? '60' : undefined;
-      response = json({ error: { code, message: status === 410 ? 'This selection has expired. Restart from page 1.'
+      response = json({ error: { code, message: code === 'production_forbidden'
+        ? 'NexWall denied access to this wallpaper selection (HTTP 403). Check the API plan and category permissions.'
+        : status === 410 ? 'This selection has expired. Restart from page 1.'
         : status === 400 ? 'Check the page and snapshot parameters.'
           : status === 429 ? 'The upstream request budget is exhausted. Retry after the quota resets.'
             : 'Wallpapers are temporarily unavailable. Please retry later.' } }, status,
-      retry ? { 'Retry-After': retry } : {});
+      retry ? { 'Retry-After': code === 'production_forbidden'
+        ? String(Math.ceil((nextUTC(Date.now()) - Date.now()) / 1000)) : retry } : {});
       console.warn(JSON.stringify({ event: 'request_error', code }));
     }
     response.headers.set('Server-Timing', `worker;dur=${Date.now() - start}`);

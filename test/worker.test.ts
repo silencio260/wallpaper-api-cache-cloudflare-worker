@@ -85,6 +85,14 @@ describe('on-demand cache', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ selected_category_id: 13, pagination: { last_page: 3 } });
   });
+  it('only advertises free categories observed in the returned page', async () => {
+    upstream(1, 200, { ...pageBody(1, 1), data: [{ ...item(1), categories: [
+      { id: 13, name: 'Nature & Landscapes', is_premium: false },
+      { id: 32, name: 'AI Generated', is_premium: true },
+    ] }] });
+    const body = await (await request()).json() as { categories: Array<{ id: number }> };
+    expect(body.categories.map(category => category.id)).toEqual([13]);
+  });
   it('returns null next_page on the final page', async () => {
     upstream(1, 200, pageBody(1, 1));
     const body = await (await request()).json();
@@ -143,6 +151,17 @@ describe('on-demand cache', () => {
     expect(await response.json()).toMatchObject({ error: { code: 'upstream_http_429' } });
     expect((await request('?category_id=13')).status).toBe(429);
     expect(calls).toBe(1);
+  });
+  it('scopes a provider 403 to the denied category instead of blocking other feeds', async () => {
+    upstream(1, 403, {}, 32);
+    const denied = await request('?category_id=32');
+    expect(denied.status).toBe(503);
+    expect(await denied.json()).toMatchObject({ error: { code: 'production_forbidden' } });
+    const blocked = await request('?category_id=32');
+    expect(await blocked.json()).toMatchObject({ error: { code: 'production_forbidden' } });
+    upstream(1, 200, pageBody(1, 1));
+    expect((await request()).status).toBe(200);
+    expect(calls).toBe(2);
   });
   it('counts failed attempts and retries of a server error', async () => {
     upstream(1, 500); upstream(1, 200, pageBody(1, 1));

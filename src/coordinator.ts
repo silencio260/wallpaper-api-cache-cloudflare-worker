@@ -42,6 +42,9 @@ export class RefreshCoordinator extends DurableObject<Env> {
         && ['invalid_api_key', 'production_forbidden'].includes(control.blockedReason ?? '')) {
         throw new ServiceError(control.blockedReason!, 503);
       }
+      if ((await this.ctx.storage.get<number>(`forbidden:${family}`) ?? 0) > now) {
+        throw new ServiceError('production_forbidden', 503);
+      }
       if (page > (head.lastPage ?? Number.MAX_SAFE_INTEGER)) throw new ServiceError('invalid_page', 400);
       const cacheKey = `page:${family}:${head.version}:${page}`;
       // All requests for this page pass through the named Durable Object. Share a
@@ -51,7 +54,7 @@ export class RefreshCoordinator extends DurableObject<Env> {
       if (hit) return { page: hit, cacheStatus: 'hit' };
       pending = this.pending.get(cacheKey);
       if (!pending) {
-        pending = this.fill(cacheKey, head, headKey, page, categoryId);
+        pending = this.fill(cacheKey, head, headKey, page, categoryId, family);
         this.pending.set(cacheKey, pending);
         void pending.finally(() => { if (this.pending.get(cacheKey) === pending) this.pending.delete(cacheKey); }).catch(() => {});
       }
@@ -68,9 +71,9 @@ export class RefreshCoordinator extends DurableObject<Env> {
       ? entry : null;
   }
 
-  private async fill(key: string, head: FeedHead, headKey: string, page: number, categoryId: number | null): Promise<CachedPage> {
+  private async fill(key: string, head: FeedHead, headKey: string, page: number, categoryId: number | null, family: string): Promise<CachedPage> {
     if (!this.env.NEXWALL_API_KEY?.trim()) throw new ServiceError('missing_api_key');
-    const parsed = parsePage(await this.fetchPage(page, categoryId), page);
+    const parsed = parsePage(await this.fetchPage(page, categoryId, family), page);
     const fetchedAt = Date.now();
     if (head.expiresAt <= fetchedAt) throw new ServiceError('snapshot_expired', 410);
     const value: CachedPage = { version: head.version, fetchedAt, expiresAt: head.expiresAt,
@@ -89,12 +92,13 @@ export class RefreshCoordinator extends DurableObject<Env> {
     return value;
   }
 
-  private async reserve(): Promise<void> {
+  private async reserve(family: string): Promise<void> {
     const budget = await this.ctx.storage.transaction(async tx => {
       // Reuse the existing durable counter from the scheduled design.
       const c = (await tx.get<Control>('control')) ?? { day: '', attempts: 0, blockedUntil: 0 };
       const now = Date.now(), day = dayOf(now);
       if (c.day > day || c.blockedUntil > now) throw new ServiceError(c.blockedReason ?? 'upstream_cooldown', 429);
+      if (((await tx.get<number>(`forbidden:${family}`)) ?? 0) > now) throw new ServiceError('production_forbidden', 503);
       if (c.day !== day) { c.day = day; c.attempts = 0; }
       if (c.attempts >= DAILY_LIMIT) throw new ServiceError('daily_budget_exhausted', 429);
       c.attempts++;
@@ -105,9 +109,9 @@ export class RefreshCoordinator extends DurableObject<Env> {
     console.log(JSON.stringify({ event: 'upstream_attempt_reserved', environment: 'production', ...budget, limit: DAILY_LIMIT }));
   }
 
-  private async fetchPage(page: number, categoryId: number | null): Promise<unknown> {
+  private async fetchPage(page: number, categoryId: number | null, family: string): Promise<unknown> {
     for (let attempt = 0; attempt < 2; attempt++) {
-      await this.reserve();
+      await this.reserve(family);
       const url = new URL(UPSTREAM);
       url.search = new URLSearchParams({ page: String(page), per_page: String(PAGE_SIZE), type: 'image', sort: 'newest' }).toString();
       if (categoryId !== null) url.searchParams.set('category_id', String(categoryId));
@@ -126,13 +130,20 @@ export class RefreshCoordinator extends DurableObject<Env> {
           const c = (await tx.get<Control>('control'))!;
           const retry = response.headers.get('Retry-After');
           const until = retry && /^\d+$/.test(retry) ? Date.now() + Number(retry) * 1000 : Date.parse(retry ?? '');
-          c.blockedUntil = Math.max(nextDay(Date.now()), Number.isFinite(until) ? until : 0);
-          c.blockedReason = response.status === 429 ? 'production_rate_limited'
-            : response.status === 401 ? 'invalid_api_key' : 'production_forbidden';
-          await tx.put('control', c);
+          const blockedUntil = Math.max(nextDay(Date.now()), Number.isFinite(until) ? until : 0);
+          if (response.status === 403) {
+            // A category-specific denial must not disable unrelated cached feeds.
+            await tx.put(`forbidden:${family}`, blockedUntil);
+          } else {
+            c.blockedUntil = blockedUntil;
+            c.blockedReason = response.status === 429 ? 'production_rate_limited' : 'invalid_api_key';
+            await tx.put('control', c);
+          }
         });
+        console.warn(JSON.stringify({ event: 'upstream_access_denied', status: response.status, page, categoryId }));
       }
       await response.body?.cancel();
+      if (response.status === 403) throw new ServiceError('production_forbidden');
       if (response.status < 500 || attempt === 1) throw new ServiceError(`upstream_http_${response.status}`,
         response.status === 429 ? 429 : 503);
       await new Promise(resolve => setTimeout(resolve, 250));
