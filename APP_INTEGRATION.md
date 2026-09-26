@@ -1,6 +1,6 @@
 # Flutter integration: Wallpaper Cache API
 
-This guide connects an existing Flutter wallpaper screen to the deployed Cloudflare Worker. The Worker alone contacts NexWall during scheduled refreshes. The app never needs a NexWall key and must not call NexWall directly.
+This guide connects an existing Flutter wallpaper screen to the deployed Cloudflare Worker. The Worker contacts NexWall only when a requested page is missing from its shared cache. The app never needs a NexWall key and must not call NexWall directly.
 
 ## 1. Choose the app environment explicitly
 
@@ -10,7 +10,7 @@ The production base URL is:
 https://wallpaper-cache.wallpaper-cache-worker.workers.dev
 ```
 
-The sandbox app environment uses a locally running copy of this Worker. Start it from this repository with `npm run dev`. Without a local `NEXWALL_API_KEY`, its scheduled refresh uses NexWall's public sandbox. On an Android emulator, the host machine is `10.0.2.2`; for an iOS simulator, use `http://127.0.0.1:8787`. A physical device needs a reachable development URL. Local data and the local request counter are separate from production.
+The sandbox app environment uses a locally running copy of this Worker. Start it from this repository with `npm run dev`. It needs a separate local development `NEXWALL_API_KEY` to fetch uncached pages; it does not use NexWall's public sandbox. On an Android emulator, the host machine is `10.0.2.2`; for an iOS simulator, use `http://127.0.0.1:8787`. A physical device needs a reachable development URL. Local data and the local request counter are separate from production.
 
 Set explicit build values:
 
@@ -26,7 +26,7 @@ flutter run --dart-define=WALLPAPER_API_ENV=cloudflare
 flutter build apk --release --dart-define=WALLPAPER_API_ENV=cloudflare
 ```
 
-The local Worker must receive a scheduled refresh before it can serve pages. With `npm run dev`, invoke `curl 'http://localhost:8787/__scheduled?cron=0+*/6+*+*+*'`. That local refresh consumes public sandbox calls, so run it only when needed. On Android, allow Internet access. Cleartext HTTP to `10.0.2.2` may need an Android **debug-only** network security configuration; production remains HTTPS.
+The local Worker fetches a page on the first request and caches it. Use a separate development key because local mode has its own quota counter. On Android, allow Internet access. Cleartext HTTP to `10.0.2.2` may need an Android **debug-only** network security configuration; production remains HTTPS.
 
 Create `lib/wallpapers/wallpaper_api_config.dart`:
 
@@ -173,7 +173,7 @@ class WallpaperApi {
       response = await _client.get(
         uri,
         headers: const {'Accept': 'application/json'},
-      ).timeout(const Duration(seconds: 12));
+      ).timeout(const Duration(seconds: 20));
     } on TimeoutException {
       throw const WallpaperApiException(
         WallpaperFailure.offline,
@@ -350,7 +350,7 @@ class WallpaperFeedController extends ChangeNotifier {
 
 Request **one next page at a time**. Keep the snapshot returned by page 1 until the user explicitly refreshes the feed. `pagination.next_page` is `null` on the final page. On HTTP `410`, clear the current items and snapshot, show “Selection expired,” and offer a button that reloads page 1. The response's `freshness.expires_at` is authoritative; clear or hide items when it passes, even if the user stays on the screen. Do not persist item metadata or URLs past that time.
 
-The Worker requests `per_page=100` upstream. When the current snapshot comes from the public sandbox, NexWall limits actual pages to **20 items**. The response reports `pagination.per_page=20`, `requested_per_page=100`, `environment="sandbox"`, and a `fallback_reason`. The Worker budgets up to 16 source pages per refresh while retaining retry room under the daily cap, so a full production snapshot can hold up to 1,600 items and a full sandbox snapshot up to 320. The source may have fewer pages. Build the grid from the returned `data.length`; do not assume every page is full or that `last_page` is always 16.
+The Worker requests `per_page=100` upstream. The response reports the actual `pagination.per_page` and `requested_per_page=100`. There is no fixed five-page or sixteen-page feed cap. Each previously uncached page consumes one NexWall request, up to the shared daily attempt limit. Build the grid from `data.length`, follow `next_page`, and deduplicate IDs if the upstream feed shifts while browsing.
 
 ## 4. Keep the existing wallpaper UI
 
@@ -360,7 +360,7 @@ The Worker requests `per_page=100` upstream. When the current snapshot comes fro
 - **Rights:** Preserve and display applicable `metadata` attribution or rights fields and page-level `notices` where the provider supplies them. Keep any required attribution visible in the UI.
 - **Errors:** Show a network message for `offline`, an expired selection message for `expired`, a retry-later message for `unavailable`, and a short wait message for `throttled`. Do not silently switch the app to a direct NexWall request.
 
-These UI operations do not alter the existing image flow. The service returns only cached selections; opening many grid pages never consumes additional NexWall requests.
+These UI operations do not alter the existing image flow. Opening an uncached grid page can consume a NexWall request; repeated and simultaneous requests for the same page share its cached result.
 
 ## 5. Verify the integration
 
@@ -370,8 +370,8 @@ Use the deployed API first:
 curl -i 'https://wallpaper-cache.wallpaper-cache-worker.workers.dev/wallpapers?page=1'
 ```
 
-Copy the returned `snapshot`, then request `?page=2&snapshot=THE_VERSION`. Follow `pagination.next_page` until it is `null`. The sandbox is a fallback because the production secret is not configured. Adding `NEXWALL_API_KEY` as a Cloudflare Worker secret makes a subsequent scheduled refresh use the production endpoint; the app build needs no change. The normal schedule is every six hours at 00:00, 06:00, 12:00 and 18:00 UTC.
+Copy the returned `snapshot`, then request `?page=2&snapshot=THE_VERSION`. Follow `pagination.next_page` until it is `null`. There is no sandbox fallback. The Worker needs `NEXWALL_API_KEY` as a Cloudflare secret to fill an uncached page; the app build needs no change. A deleted KV page is refilled on demand, subject to the daily quota.
 
 Check these cases in the app: airplane mode, HTTP 503, snapshot expiry/410, rapid repeated scrolling, a refresh while browsing page 2, preview, download, and applying a wallpaper. Confirm that the `snapshot` parameter stays the same across pages. App builds and device checks belong in the Flutter project.
 
-The [NexWall license](https://nexwall.kodnextech.com/wallpaper-api/license) permits reasonable temporary caching and requires honoring removals and rights notices. This Worker expires snapshots after six hours. See [README.md](README.md) for server deployment and operation details.
+The [NexWall license](https://nexwall.kodnextech.com/wallpaper-api/license) permits reasonable temporary caching and requires honoring removals and rights notices. This Worker expires each browsing generation and its cached pages six hours after the first page-1 request. See [README.md](README.md) for server deployment and operation details.

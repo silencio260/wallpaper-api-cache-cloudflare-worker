@@ -1,37 +1,31 @@
 export const PERIOD_MS = 6 * 60 * 60 * 1000;
-// Four refreshes/day * 16 planned requests = 64, leaving 16 retry attempts under the 80/day ceiling.
-export const PLANNED_PAGES_PER_REFRESH = 16;
 export const PAGE_SIZE = 100;
 export const DAILY_LIMIT = 80;
 export const COORDINATOR_NAME = 'nexwall-production-v1';
 export const UPSTREAM = 'https://nexwall.kodnextech.com/api/developer/v1/wallpapers';
-export const SANDBOX_UPSTREAM = 'https://nexwall.kodnextech.com/wallpaper-api/sandbox';
-export type FeedEnvironment = 'production' | 'sandbox';
+export type FeedEnvironment = 'production';
 
 export interface Wallpaper extends Record<string, unknown> {
   id: number | string;
   image_url: string;
   thumbnail_url: string;
 }
-export interface Snapshot {
+export interface CachedPage {
   version: string;
   fetchedAt: number;
   expiresAt: number;
-  pages: Wallpaper[][];
-  notices: Record<string, unknown>[];
-  environment?: FeedEnvironment;
-  fallbackReason?: string;
-  pageSize?: number;
+  page: number;
+  categoryId: number | null;
+  items: Wallpaper[];
+  notices: Record<string, unknown>;
+  pageSize: number;
+  lastPage: number;
+  total: number | null;
 }
-export interface SnapshotRef {
+export interface FeedHead {
   version: string;
   expiresAt: number;
-  availableUntil: number;
-  environment?: FeedEnvironment;
-}
-export interface Manifest {
-  current: SnapshotRef;
-  previous?: SnapshotRef;
+  lastPage?: number;
 }
 export class ServiceError extends Error {
   constructor(public code: string, public status = 503) { super(code); }
@@ -54,7 +48,7 @@ function httpsUrl(value: unknown): value is string {
   try { const u = new URL(value); return u.protocol === 'https:' && !u.username && !u.password; }
   catch { return false; }
 }
-export function parsePage(body: unknown, page: number): { items: Wallpaper[]; notices: Record<string, unknown>; pageSize: number; lastPage: number } {
+export function parsePage(body: unknown, page: number): { items: Wallpaper[]; notices: Record<string, unknown>; pageSize: number; lastPage: number; total: number | null } {
   if (!object(body) || !Array.isArray(body.data) || body.data.length > PAGE_SIZE) throw new ServiceError('invalid_upstream_schema');
   const meta = object(body.meta) ? body.meta : body;
   if (meta.current_page !== page || !Number.isInteger(meta.last_page) || Number(meta.last_page) < 1) {
@@ -75,5 +69,7 @@ export function parsePage(body: unknown, page: number): { items: Wallpaper[]; no
       thumbnail_url: (value.thumbnail_url ?? value.image_url) as string });
   }
   const notices = Object.fromEntries(Object.entries(body).filter(([key]) => /attribution|license|rights|copyright|notice/i.test(key)));
-  return { items, notices, pageSize: Number(pageSize), lastPage: Number(meta.last_page) };
+  const total = meta.total;
+  if (total != null && (!Number.isInteger(total) || Number(total) < 0)) throw new ServiceError('invalid_upstream_pagination');
+  return { items, notices, pageSize: Number(pageSize), lastPage: Number(meta.last_page), total: total == null ? null : Number(total) };
 }

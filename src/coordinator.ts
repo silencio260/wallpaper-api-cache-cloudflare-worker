@@ -1,141 +1,119 @@
 import { DurableObject } from 'cloudflare:workers';
-import { DAILY_LIMIT, PLANNED_PAGES_PER_REFRESH, PAGE_SIZE, PERIOD_MS, UPSTREAM, SANDBOX_UPSTREAM, ServiceError, parsePage, type Manifest, type Snapshot, type FeedEnvironment } from './model';
+import { DAILY_LIMIT, PAGE_SIZE, PERIOD_MS, UPSTREAM, ServiceError, parsePage, type CachedPage, type FeedHead } from './model';
 import type { Env } from './index';
 
 interface Control {
   day: string;
   attempts: number;
-  lastSlot: number;
-  lastGeneration?: string;
-  leaseUntil: number;
-  owner: string;
   blockedUntil: number;
   blockedReason?: string;
-  sandboxBlockedUntil?: number;
 }
-const initial = (): Control => ({ day: '', attempts: 0, lastSlot: -1, leaseUntil: 0, owner: '', blockedUntil: 0 });
+export type PageResult = { page: CachedPage; cacheStatus: 'hit' | 'miss' } | { error: { code: string; status: number } };
 const dayOf = (now: number) => new Date(now).toISOString().slice(0, 10);
 const nextDay = (now: number) => Date.parse(dayOf(now)) + 86400000;
+const familyOf = (categoryId: number | null) => categoryId === null ? 'all' : `category-${categoryId}`;
 
 export class RefreshCoordinator extends DurableObject<Env> {
-  private running = false;
+  private pending = new Map<string, Promise<CachedPage>>();
 
-  async manifest(): Promise<Manifest | null> { return (await this.ctx.storage.get<Manifest>('manifest')) ?? null; }
-
-  async refresh(scheduledTime: number): Promise<{ status: string }> {
-    if (this.env.SERVICE_ENABLED !== 'true') return { status: 'disabled' };
-    if (this.running) return { status: 'already_running' };
-    const now = Date.now();
-    // Ignore delayed deliveries from an earlier scheduling window and invalid times.
-    if (!Number.isFinite(scheduledTime) || scheduledTime > now + 60000 || now - scheduledTime > PERIOD_MS) return { status: 'invalid_schedule' };
-    const slot = Math.floor(scheduledTime / PERIOD_MS);
-    const owner = crypto.randomUUID();
-    this.running = true;
+  async getPage(page: number, version: string | null, categoryId: number | null): Promise<PageResult> {
     try {
-      const acquired = await this.ctx.storage.transaction(async tx => {
-        const c = (await tx.get<Control>('control')) ?? initial();
-        if (c.leaseUntil > now || c.lastSlot > slot
-          || (c.lastSlot === slot && (c.lastGeneration ?? '1') === this.env.REFRESH_GENERATION)) return false;
-        c.owner = owner; c.lastSlot = slot; c.lastGeneration = this.env.REFRESH_GENERATION;
-        c.leaseUntil = now + 120000;
-        await tx.put('control', c);
-        return true;
-      });
-      if (!acquired) return { status: 'skipped' };
-      const control = (await this.ctx.storage.get<Control>('control'))!;
-      const fallbackReason = !this.env.NEXWALL_API_KEY?.trim() ? 'missing_api_key'
-        : control.blockedUntil > now ? control.blockedReason ?? 'production_cooldown' : undefined;
-      // A 403 is an access restriction, not a reason to switch sources.
-      if (fallbackReason === 'production_forbidden') throw new ServiceError('upstream_cooldown');
-      const snapshot: Snapshot = { version: owner, fetchedAt: now, expiresAt: now + PERIOD_MS,
-        pages: [], notices: [], environment: fallbackReason ? 'sandbox' : 'production', fallbackReason };
-      const seen = new Set<string>();
-      for (let page = 1; page <= PLANNED_PAGES_PER_REFRESH; page++) {
-        let body: unknown;
-        try { body = await this.fetchPage(page, owner, snapshot.environment!); }
-        catch (error) {
-          if (snapshot.environment !== 'production' || !(error instanceof ServiceError)
-            || !['upstream_http_401', 'upstream_http_429'].includes(error.code)) throw error;
-          snapshot.environment = 'sandbox';
-          snapshot.fallbackReason = error.code === 'upstream_http_429' ? 'production_rate_limited' : 'invalid_api_key';
-          // Never mix production and sandbox pages in one published snapshot.
-          snapshot.pages = []; snapshot.notices = []; snapshot.pageSize = undefined; seen.clear();
-          page = 0;
-          continue;
-        }
-        const parsed = parsePage(body, page);
-        if (snapshot.pageSize !== undefined && snapshot.pageSize !== parsed.pageSize) throw new ServiceError('inconsistent_page_size');
-        snapshot.pageSize = parsed.pageSize;
-        snapshot.pages.push(parsed.items.filter(item => {
-          const id = String(item.id);
-          if (seen.has(id)) return false;
-          seen.add(id); return true;
-        }));
-        snapshot.notices.push(parsed.notices);
-        if (page >= parsed.lastPage) break;
+      if (this.env.SERVICE_ENABLED !== 'true') throw new ServiceError('service_disabled');
+      const family = familyOf(categoryId);
+      const headKey = `head:${family}`;
+      const now = Date.now();
+      let head = await this.ctx.storage.get<FeedHead>(headKey);
+      if (version && (!head || head.version !== version || head.expiresAt <= now)) {
+        throw new ServiceError('snapshot_expired', 410);
       }
-      // One immutable KV value contains every page: no torn multi-key snapshots.
-      await this.env.WALLPAPER_CACHE.put(`snapshot:${owner}`, JSON.stringify(snapshot), {
-        expiration: Math.ceil(snapshot.expiresAt / 1000),
-      });
-      await this.ctx.storage.transaction(async tx => {
-        const c = await tx.get<Control>('control');
-        if (c?.owner !== owner || c.leaseUntil <= Date.now()) throw new ServiceError('refresh_lease_lost');
-        const old = await tx.get<Manifest>('manifest');
-        const manifest: Manifest = {
-          current: { version: owner, expiresAt: snapshot.expiresAt, availableUntil: snapshot.expiresAt, environment: snapshot.environment },
-          previous: old?.current && old.current.expiresAt > Date.now()
-            && (old.current.environment ?? 'production') === snapshot.environment
-            ? { ...old.current, availableUntil: Math.min(old.current.expiresAt, Date.now() + 10 * 60000) } : undefined,
-        };
-        await tx.put('manifest', manifest);
-      });
-      console.log(JSON.stringify({ event: 'refresh_published', version: owner, environment: snapshot.environment,
-        fallbackReason: snapshot.fallbackReason, items: seen.size, pageSize: snapshot.pageSize, durationMs: Date.now() - now }));
-      return { status: 'published' };
-    } catch (error) {
-      const code = error instanceof ServiceError ? error.code : 'refresh_internal_error';
-      console.error(JSON.stringify({ event: 'refresh_failed', code, durationMs: Date.now() - now }));
-      return { status: code };
-    } finally {
-      try {
-        await this.ctx.storage.transaction(async tx => {
-          const c = await tx.get<Control>('control');
-          if (c?.owner === owner) { c.leaseUntil = 0; await tx.put('control', c); }
+      if (!head || head.expiresAt <= now) {
+        if (page !== 1) throw new ServiceError('snapshot_expired', 410);
+        // A new browsing generation is created only when page 1 is requested.
+        head = await this.ctx.storage.transaction(async tx => {
+          const latest = await tx.get<FeedHead>(headKey);
+          if (latest && latest.expiresAt > Date.now()) return latest;
+          const created: FeedHead = { version: crypto.randomUUID(), expiresAt: Date.now() + PERIOD_MS };
+          await tx.put(headKey, created);
+          return created;
         });
-      } finally { this.running = false; }
+      }
+      const control = await this.ctx.storage.get<Control>('control');
+      if (control && control.blockedUntil > now
+        && ['invalid_api_key', 'production_forbidden'].includes(control.blockedReason ?? '')) {
+        throw new ServiceError(control.blockedReason!, 503);
+      }
+      if (page > (head.lastPage ?? Number.MAX_SAFE_INTEGER)) throw new ServiceError('invalid_page', 400);
+      const cacheKey = `page:${family}:${head.version}:${page}`;
+      // All requests for this page pass through the named Durable Object. Share a
+      // pending miss so concurrent users consume only one upstream attempt.
+      let pending = this.pending.get(cacheKey);
+      const hit = !pending && await this.readCached(cacheKey, head.version, page, categoryId);
+      if (hit) return { page: hit, cacheStatus: 'hit' };
+      pending = this.pending.get(cacheKey);
+      if (!pending) {
+        pending = this.fill(cacheKey, head, headKey, page, categoryId);
+        this.pending.set(cacheKey, pending);
+        void pending.finally(() => { if (this.pending.get(cacheKey) === pending) this.pending.delete(cacheKey); }).catch(() => {});
+      }
+      return { page: await pending, cacheStatus: 'miss' };
+    } catch (error) {
+      const known = error instanceof ServiceError;
+      return { error: { code: known ? error.code : 'service_error', status: known ? error.status : 503 } };
     }
   }
 
-  private async reserve(owner: string, environment: FeedEnvironment): Promise<void> {
+  private async readCached(key: string, version: string, page: number, categoryId: number | null): Promise<CachedPage | null> {
+    const entry = await this.env.WALLPAPER_CACHE.get<CachedPage>(key, 'json');
+    return entry?.version === version && entry.page === page && entry.categoryId === categoryId && entry.expiresAt > Date.now()
+      ? entry : null;
+  }
+
+  private async fill(key: string, head: FeedHead, headKey: string, page: number, categoryId: number | null): Promise<CachedPage> {
+    if (!this.env.NEXWALL_API_KEY?.trim()) throw new ServiceError('missing_api_key');
+    const parsed = parsePage(await this.fetchPage(page, categoryId), page);
+    const fetchedAt = Date.now();
+    if (head.expiresAt <= fetchedAt) throw new ServiceError('snapshot_expired', 410);
+    const value: CachedPage = { version: head.version, fetchedAt, expiresAt: head.expiresAt,
+      page, categoryId, items: parsed.items, notices: parsed.notices, pageSize: parsed.pageSize,
+      lastPage: parsed.lastPage, total: parsed.total };
+    // KV is the page cache. A missing/deleted entry can be refilled on the next request.
+    await this.env.WALLPAPER_CACHE.put(key, JSON.stringify(value), { expiration: Math.ceil(head.expiresAt / 1000) });
+    if (page === 1) {
+      await this.ctx.storage.transaction(async tx => {
+        const current = await tx.get<FeedHead>(headKey);
+        if (current?.version === head.version) await tx.put(headKey, { ...current, lastPage: parsed.lastPage });
+      });
+    }
+    console.log(JSON.stringify({ event: 'page_cached', version: head.version, page, categoryId,
+      items: value.items.length, lastPage: value.lastPage }));
+    return value;
+  }
+
+  private async reserve(): Promise<void> {
     const budget = await this.ctx.storage.transaction(async tx => {
-      const c = (await tx.get<Control>('control')) ?? initial();
+      // Reuse the existing durable counter from the scheduled design.
+      const c = (await tx.get<Control>('control')) ?? { day: '', attempts: 0, blockedUntil: 0 };
       const now = Date.now(), day = dayOf(now);
-      if (c.owner !== owner || c.leaseUntil <= now) throw new ServiceError('refresh_lease_lost');
-      const blockedUntil = environment === 'production' ? c.blockedUntil : c.sandboxBlockedUntil ?? 0;
-      if (c.day > day || blockedUntil > now) throw new ServiceError('upstream_cooldown');
+      if (c.day > day || c.blockedUntil > now) throw new ServiceError(c.blockedReason ?? 'upstream_cooldown', 429);
       if (c.day !== day) { c.day = day; c.attempts = 0; }
-      if (c.attempts >= DAILY_LIMIT) throw new ServiceError('daily_budget_exhausted');
+      if (c.attempts >= DAILY_LIMIT) throw new ServiceError('daily_budget_exhausted', 429);
       c.attempts++;
-      c.leaseUntil = now + 120000;
-      // Commit before sending: timeouts, redirects, HTTP failures and retries count.
+      // Reserve before the network call: failures, timeouts and retries all count.
       await tx.put('control', c);
       return { day: c.day, attempts: c.attempts };
     });
-    console.log(JSON.stringify({ event: 'upstream_attempt_reserved', environment, ...budget, limit: DAILY_LIMIT }));
+    console.log(JSON.stringify({ event: 'upstream_attempt_reserved', environment: 'production', ...budget, limit: DAILY_LIMIT }));
   }
 
-  private async fetchPage(page: number, owner: string, environment: FeedEnvironment): Promise<unknown> {
+  private async fetchPage(page: number, categoryId: number | null): Promise<unknown> {
     for (let attempt = 0; attempt < 2; attempt++) {
-      await this.reserve(owner, environment);
-      const url = new URL(environment === 'production' ? UPSTREAM : SANDBOX_UPSTREAM);
+      await this.reserve();
+      const url = new URL(UPSTREAM);
       url.search = new URLSearchParams({ page: String(page), per_page: String(PAGE_SIZE), type: 'image', sort: 'newest' }).toString();
-      if (environment === 'sandbox') url.searchParams.set('endpoint', 'wallpapers');
-      const headers: Record<string, string> = { Accept: 'application/json' };
-      if (environment === 'production') headers.Authorization = `Bearer ${this.env.NEXWALL_API_KEY}`;
+      if (categoryId !== null) url.searchParams.set('category_id', String(categoryId));
       let response: Response;
       try {
-        response = await fetch(url, { headers,
+        response = await fetch(url, { headers: { Accept: 'application/json', Authorization: `Bearer ${this.env.NEXWALL_API_KEY}` },
           redirect: 'manual', signal: AbortSignal.timeout(8000) });
         if (response.ok) return await response.json();
       } catch {
@@ -148,20 +126,15 @@ export class RefreshCoordinator extends DurableObject<Env> {
           const c = (await tx.get<Control>('control'))!;
           const retry = response.headers.get('Retry-After');
           const until = retry && /^\d+$/.test(retry) ? Date.now() + Number(retry) * 1000 : Date.parse(retry ?? '');
-          const blockedUntil = Math.max(nextDay(Date.now()), Number.isFinite(until) ? until : 0);
-          if (environment === 'sandbox') c.sandboxBlockedUntil = blockedUntil;
-          else {
-            c.blockedUntil = blockedUntil;
-            c.blockedReason = response.status === 429 ? 'production_rate_limited'
-              : response.status === 401 ? 'invalid_api_key' : 'production_forbidden';
-          }
+          c.blockedUntil = Math.max(nextDay(Date.now()), Number.isFinite(until) ? until : 0);
+          c.blockedReason = response.status === 429 ? 'production_rate_limited'
+            : response.status === 401 ? 'invalid_api_key' : 'production_forbidden';
           await tx.put('control', c);
-          // Access failures invalidate the old selection too.
-          if (response.status !== 429) await tx.delete('manifest');
         });
       }
       await response.body?.cancel();
-      if (response.status < 500 || attempt === 1) throw new ServiceError(`upstream_http_${response.status}`);
+      if (response.status < 500 || attempt === 1) throw new ServiceError(`upstream_http_${response.status}`,
+        response.status === 429 ? 429 : 503);
       await new Promise(resolve => setTimeout(resolve, 250));
     }
     throw new ServiceError('upstream_unavailable');

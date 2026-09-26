@@ -10,7 +10,6 @@
     "bindings": [{ "name": "REFRESH_COORDINATOR", "class_name": "RefreshCoordinator" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RefreshCoordinator"] }],
-  "triggers": { "crons": ["0 */6 * * *"] },
   "ratelimits": [{
     "name": "APP_RATE_LIMITER",
     "namespace_id": "1001",
@@ -19,7 +18,7 @@
   "vars": {
     "SERVICE_ENABLED": "true",
     "BLOCKED_WALLPAPER_IDS": "",
-    "POLICY_VERSION": "1",
+    "POLICY_VERSION": "2",
     "REFRESH_GENERATION": "2"
   },
   "observability": { "enabled": true }

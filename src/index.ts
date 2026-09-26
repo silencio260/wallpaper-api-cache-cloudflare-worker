@@ -1,6 +1,6 @@
-import type { RefreshCoordinator } from './coordinator';
+import type { RefreshCoordinator, PageResult } from './coordinator';
 import { checkDatabase } from './database';
-import { COORDINATOR_NAME, PAGE_SIZE, ServiceError, type Manifest, type Snapshot } from './model';
+import { COORDINATOR_NAME, PAGE_SIZE, ServiceError, type CachedPage } from './model';
 export { RefreshCoordinator } from './coordinator';
 
 export interface Env {
@@ -15,25 +15,18 @@ export interface Env {
   HYPERDRIVE?: Hyperdrive;
 }
 
+const CATEGORY_NAMES: Readonly<Record<number, string>> = {
+  13: 'Nature & Landscapes', 1: 'AMOLED & OLED', 32: 'AI Generated',
+  3: 'Anime & Manga', 9: 'Dark & Moody', 8: 'Cars & Bikes',
+  11: 'Gaming', 6: 'Aesthetic & Vaporwave', 21: 'Devotional & Spiritual',
+  57: 'Quotes & Typography',
+};
+const CATEGORY_ORDER = [13, 1, 32, 3, 9, 8, 11, 6, 21, 57];
 const coordinator = (env: Env) => env.REFRESH_COORDINATOR.get(env.REFRESH_COORDINATOR.idFromName(COORDINATOR_NAME));
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) => Response.json(body, {
   status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers },
 });
-
-async function cached<T>(request: Request, key: string, env: Env, ctx: ExecutionContext,
-  loader: () => Promise<T | null>): Promise<T | null> {
-  const url = new URL(request.url);
-  url.pathname = `/__internal_cache/${encodeURIComponent(env.POLICY_VERSION)}/${key}`;
-  url.search = '';
-  const cacheKey = new Request(url);
-  const hit = await caches.default.match(cacheKey);
-  if (hit) return hit.json<T>();
-  const result = await loader();
-  if (result) ctx.waitUntil(caches.default.put(cacheKey, Response.json(result, {
-    headers: { 'Cache-Control': 'public, max-age=15' },
-  })).catch(() => console.warn(JSON.stringify({ event: 'edge_cache_write_failed' }))));
-  return result;
-}
+const nextUTC = (now: number) => Date.parse(new Date(now).toISOString().slice(0, 10)) + 86400000;
 
 async function serve(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
@@ -43,53 +36,53 @@ async function serve(request: Request, env: Env, ctx: ExecutionContext): Promise
   const limit = await env.APP_RATE_LIMITER.limit({ key: request.headers.get('CF-Connecting-IP') ?? 'local' });
   if (!limit.success) return json({ error: { code: 'rate_limited', message: 'Please wait before requesting more pages.' } }, 429, { 'Retry-After': '60' });
   for (const key of url.searchParams.keys()) {
-    if (!['page', 'snapshot'].includes(key) || url.searchParams.getAll(key).length !== 1) throw new ServiceError('invalid_query', 400);
+    if (!['page', 'snapshot', 'category_id'].includes(key) || url.searchParams.getAll(key).length !== 1) throw new ServiceError('invalid_query', 400);
   }
   const pageText = url.searchParams.get('page') ?? '1';
   if (!/^[1-9]\d{0,3}$/.test(pageText)) throw new ServiceError('invalid_page', 400);
   const page = Number(pageText), version = url.searchParams.get('snapshot');
+  const categoryText = url.searchParams.get('category_id');
+  if (categoryText !== null && !/^[1-9]\d{0,3}$/.test(categoryText)) throw new ServiceError('invalid_category', 400);
+  const categoryId = categoryText === null ? null : Number(categoryText);
   if (version !== null && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(version)) throw new ServiceError('invalid_snapshot', 400);
   if (page > 1 && !version) throw new ServiceError('snapshot_required', 400);
 
-  const manifest = await cached<Manifest>(request, 'manifest', env, ctx, () => coordinator(env).manifest());
-  if (!manifest) throw new ServiceError('cache_unavailable');
-  const now = Date.now();
-  if (manifest.current.expiresAt <= now) {
-    throw new ServiceError(version ? 'snapshot_expired' : 'cache_expired', version ? 410 : 503);
+  // This short cache is an optimization. The Durable Object and KV decide misses.
+  const cacheUrl = new URL(request.url);
+  cacheUrl.pathname = `/__edge/${encodeURIComponent(env.POLICY_VERSION)}/wallpapers`;
+  cacheUrl.search = new URLSearchParams({ page: String(page), category_id: categoryText ?? '', snapshot: version ?? '' }).toString();
+  const edgeKey = new Request(cacheUrl);
+  const edge = await caches.default.match(edgeKey);
+  if (edge) {
+    const result = new Response(edge.body, edge);
+    result.headers.set('Cache-Control', 'no-store');
+    result.headers.set('X-Cache-Status', 'edge');
+    return result;
   }
-  const ref = !version || version === manifest.current.version ? manifest.current
-    : version === manifest.previous?.version ? manifest.previous : null;
-  if (!ref || ref.availableUntil <= now || ref.expiresAt <= now) throw new ServiceError('snapshot_expired', 410);
-  const load = (v: string) => cached<Snapshot>(request, `snapshot/${v}`, env, ctx,
-    () => env.WALLPAPER_CACHE.get<Snapshot>(`snapshot:${v}`, 'json'));
-  const snapshot = await load(ref.version);
-  if (!snapshot) throw new ServiceError('snapshot_propagating');
-  if (snapshot.expiresAt <= Date.now()) throw new ServiceError('cache_expired');
-  if (page > snapshot.pages.length) throw new ServiceError('invalid_page', 400);
-  const current = ref.version === manifest.current.version ? snapshot : await load(manifest.current.version);
-  if (!current || current.expiresAt <= Date.now()) throw new ServiceError('cache_unavailable');
-  // A retained page keeps its ordering but only serves still-selected IDs, using updated URLs/rights.
-  const currentItems = new Map(current.pages.flat().map(item => [String(item.id), item]));
+
+  const result = await coordinator(env).getPage(page, version, categoryId) as PageResult;
+  if ('error' in result) throw new ServiceError(result.error.code, result.error.status);
+  const cached: CachedPage = result.page;
   const blocked = new Set(env.BLOCKED_WALLPAPER_IDS.split(',').map(id => id.trim()).filter(Boolean));
-  const pages = snapshot.pages.map(items => items.flatMap(item => {
-    const id = String(item.id), latest = currentItems.get(id);
-    return latest && !blocked.has(id) ? [latest] : [];
-  }));
-  const end = Math.min(ref.availableUntil, snapshot.expiresAt);
-  return json({
-    data: pages[page - 1],
-    pagination: { current_page: page, per_page: snapshot.pageSize ?? PAGE_SIZE, requested_per_page: PAGE_SIZE,
-      last_page: pages.length, total: pages.flat().length, has_more: page < pages.length,
-      next_page: page < pages.length ? page + 1 : null },
-    snapshot: snapshot.version,
-    freshness: { fetched_at: new Date(snapshot.fetchedAt).toISOString(), expires_at: new Date(end).toISOString(),
-      age_seconds: Math.max(0, Math.floor((Date.now() - snapshot.fetchedAt) / 1000)),
-      status: ref.version === manifest.current.version ? 'fresh' : 'previous' },
-    notices: current.notices,
-    source: 'NexWall',
-    environment: snapshot.environment ?? 'production',
-    fallback_reason: snapshot.fallbackReason ?? null,
-  });
+  const items = cached.items.filter(item => !blocked.has(String(item.id)));
+  const response = json({
+    data: items,
+    categories: CATEGORY_ORDER.map(id => ({ id, name: CATEGORY_NAMES[id] })),
+    selected_category_id: categoryId,
+    pagination: { current_page: page, per_page: cached.pageSize, requested_per_page: PAGE_SIZE,
+      last_page: cached.lastPage, total: cached.total, has_more: page < cached.lastPage,
+      next_page: page < cached.lastPage ? page + 1 : null },
+    snapshot: cached.version,
+    freshness: { fetched_at: new Date(cached.fetchedAt).toISOString(), expires_at: new Date(cached.expiresAt).toISOString(),
+      age_seconds: Math.max(0, Math.floor((Date.now() - cached.fetchedAt) / 1000)), status: 'fresh' },
+    notices: Object.keys(cached.notices).length ? [cached.notices] : [],
+    source: 'NexWall', environment: 'production', fallback_reason: null,
+  }, 200, { 'X-Cache-Status': result.cacheStatus });
+  const ttl = Math.min(15, Math.floor((cached.expiresAt - Date.now()) / 1000));
+  if (ttl > 0) ctx.waitUntil(caches.default.put(edgeKey, new Response(response.clone().body, {
+    status: 200, headers: { 'Cache-Control': `public, max-age=${ttl}` },
+  })).catch(() => console.warn(JSON.stringify({ event: 'edge_cache_write_failed' }))));
+  return response;
 }
 
 export default {
@@ -100,27 +93,28 @@ export default {
     catch (error) {
       const known = error instanceof ServiceError;
       const code = known ? error.code : 'service_error', status = known ? error.status : 503;
-      response = json({ error: { code, message: status === 410 ? 'This snapshot has expired. Restart from page 1.'
-        : status === 400 ? 'Check the page and snapshot parameters.' : 'Wallpapers are temporarily unavailable. Please retry later.' } }, status,
-        status === 503 ? { 'Retry-After': '60' } : {});
+      const retry = status === 429 && code !== 'rate_limited'
+        ? String(Math.ceil((nextUTC(Date.now()) - Date.now()) / 1000)) : status === 503 ? '60' : undefined;
+      response = json({ error: { code, message: status === 410 ? 'This selection has expired. Restart from page 1.'
+        : status === 400 ? 'Check the page and snapshot parameters.'
+          : status === 429 ? 'The upstream request budget is exhausted. Retry after the quota resets.'
+            : 'Wallpapers are temporarily unavailable. Please retry later.' } }, status,
+      retry ? { 'Retry-After': retry } : {});
       console.warn(JSON.stringify({ event: 'request_error', code }));
     }
     response.headers.set('Server-Timing', `worker;dur=${Date.now() - start}`);
     console.log(JSON.stringify({ event: 'app_request', status: response.status, durationMs: Date.now() - start }));
     return response;
   },
-  async scheduled(controller, env): Promise<void> {
-    if (env.HYPERDRIVE) {
-      const start = Date.now();
-      try {
-        await checkDatabase(env.HYPERDRIVE);
-        console.log(JSON.stringify({ event: 'database_check', status: 'ok', durationMs: Date.now() - start }));
-      } catch {
-        // Never log driver errors: they may contain database hosts or credentials.
-        console.error(JSON.stringify({ event: 'database_check', status: 'failed', durationMs: Date.now() - start }));
-      }
+  // Retained for optional Hyperdrive checks; no scheduled handler fetches wallpapers.
+  async scheduled(_controller, env): Promise<void> {
+    if (!env.HYPERDRIVE) return;
+    const start = Date.now();
+    try {
+      await checkDatabase(env.HYPERDRIVE);
+      console.log(JSON.stringify({ event: 'database_check', status: 'ok', durationMs: Date.now() - start }));
+    } catch {
+      console.error(JSON.stringify({ event: 'database_check', status: 'failed', durationMs: Date.now() - start }));
     }
-    const result = await coordinator(env).refresh(controller.scheduledTime);
-    console.log(JSON.stringify({ event: 'scheduled_refresh', ...result }));
   },
 } satisfies ExportedHandler<Env>;

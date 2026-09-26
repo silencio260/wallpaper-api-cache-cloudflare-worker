@@ -1,53 +1,37 @@
 # Wallpaper cache Worker
 
-TypeScript Cloudflare Worker backed by KV and a SQLite Durable Object. The app path never contacts NexWall. Only a scheduled refresh can do so. The source contains no production credentials.
+A TypeScript Cloudflare Worker that serves NexWall wallpaper pages through a shared, on-demand KV cache. The app calls only this Worker; the NexWall production key stays in a Worker secret. A cold page request may contact NexWall. Repeated requests for the same page use the cache, and simultaneous misses are coordinated by a Durable Object.
 
-Deployed endpoint: **https://wallpaper-cache.wallpaper-cache-worker.workers.dev/wallpapers?page=1**.
-Deployment version: see `npx wrangler deployments status`.
+Production endpoint: `https://wallpaper-cache.wallpaper-cache-worker.workers.dev/wallpapers?page=1`. See [APP_INTEGRATION.md](APP_INTEGRATION.md) for the Flutter contract.
 
-For Flutter client setup, see [APP_INTEGRATION.md](APP_INTEGRATION.md).
+## Setup
 
-Deployment verification: 33 tests and TypeScript checks passed locally. The expanded live sandbox snapshot published 318 unique wallpapers across 16 pages; its page size is 20 because the sandbox clamps the requested 100. Its refresh log recorded 16 sandbox attempts and a durable daily count moving from 10 to 26. Authenticated production fetching and real Postgres connectivity remain unverified until the secret and Hyperdrive configuration are supplied.
+Use Node 22 or 24+. Run `npm ci --legacy-peer-deps`, `npm run check`, then `npm run deploy`. Add the production key in **Cloudflare → Workers & Pages → wallpaper-cache → Settings → Variables and Secrets → Add → Secret** under the exact name `NEXWALL_API_KEY`. Or enter it at the private prompt from `npx wrangler secret put NEXWALL_API_KEY`. Do not put the value in Git, `wrangler.jsonc`, Flutter, command arguments, or chat. `npm run deploy` uses `--keep-vars` to preserve dashboard variables and secrets.
 
-## Development and deployment
+The configured KV binding is `WALLPAPER_CACHE`; the named Durable Object binding is `REFRESH_COORDINATOR`. Its name and class are retained from the previous scheduled design so the durable request counter is not reset on deployment. There is no wallpaper refresh cron or public refresh endpoint. Local `npm run dev` has a separate KV and counter; use only a separate development key for local upstream testing.
 
-Use Node 22 LTS or Node 24+.
-
-```sh
-npm ci --legacy-peer-deps
-npm run check
-npm run dry-run
-npm run dev
-```
-
-The configured production account and `WALLPAPER_CACHE` namespace have been provisioned. Wrangler local mode uses separate local data. Tests use mock upstream responses and isolated local Cloudflare runtime storage; they do not use a real NexWall key.
-
-Deploy with `npm run deploy`. Add the production key through **Cloudflare → Workers & Pages → wallpaper-cache → Settings → Variables and Secrets → Add → Secret**, named `NEXWALL_API_KEY`. Alternatively enter it into the private interactive prompt from `npx wrangler secret put NEXWALL_API_KEY`. Never put it in Wrangler vars, source files, Flutter, command arguments, or chat.
-
-Refresh runs at **00:00, 06:00, 12:00, and 18:00 UTC** (01:00, 07:00, 13:00, and 19:00 Lagos). A missing key selects NexWall's public sandbox automatically. A production 401 or 429 also switches the entire refresh to sandbox; 403 access restrictions do not. Responses explicitly report `environment` and `fallback_reason`. Sandbox failures still return unavailable if no unexpired snapshot exists. No public refresh endpoint exists. Bootstrap can temporarily use a minute cron, with durable slot deduplication, then restore the normal cron after publication.
-
-For local scheduled testing, use `npm run dev` and `curl 'http://localhost:8787/__scheduled?cron=0+*/6+*+*+*'`. Without a locally configured secret this fetches the public sandbox. Never use a production key with an independent local coordinator: it would have a separate counter.
-
-## App API
+## API contract
 
 ```text
 GET /wallpapers?page=1
-GET /wallpapers?page=2&snapshot=<version-returned-by-page-1>
+GET /wallpapers?page=2&snapshot=<version-from-page-1>
+GET /wallpapers?page=1&category_id=13
+GET /wallpapers?page=2&category_id=13&snapshot=<category-version>
 ```
 
-Pages start at 1 and continue through the published snapshot's `pagination.last_page`. Pages after 1 require a snapshot; unknown query parameters and duplicates are rejected. Each page contains up to the number the provider returns. Metadata and hosted URLs are returned; this server does not download or cache image files. Upstream duplicates, live images, premium entries and known restricted/withdrawn items are excluded. Empty or shorter pages are valid.
-
-Every upstream request asks for **100 entries**, the documented production maximum. The public sandbox was verified to clamp this to **20 entries per page**. The Worker fetches up to 16 provider pages per refresh, or stops earlier at the provider's last page. This allows up to 320 sandbox items or 1,600 production items per snapshot while planning 64 requests per day and leaving 16 attempts for retries under the 80/day cap. `pagination.per_page` reports the provider's actual page size and `requested_per_page` reports 100. Both feeds use the verified `type=image` static-image filter (`type=static` returned no data). The sandbox URL is `/wallpaper-api/sandbox?endpoint=wallpapers`; it does not need a bearer token. The `sandbox_key_demo` token advertised in the console is not used.
+A page-1 request starts or reuses a six-hour browsing generation for that category or the unfiltered feed. Later pages require its `snapshot` UUID. A different category has a separate generation; start it at page 1 without carrying the old category's snapshot. The Worker forwards `page`, `category_id` when present, `per_page=100`, `type=image`, and `sort=newest` to NexWall only on a cache miss. The provider's reported `last_page` and `per_page` drive pagination. There is no five-page or sixteen-page feed cap. `pagination.next_page` is `null` at the end. Unknown, duplicate, or malformed parameters are rejected. The response includes only metadata and hosted image URLs, never image files or the API key.
 
 ```json
 {
   "data": [],
+  "categories": [{ "id": 13, "name": "Nature & Landscapes" }],
+  "selected_category_id": null,
   "pagination": {
     "current_page": 1,
-    "per_page": 20,
+    "per_page": 100,
     "requested_per_page": 100,
-    "last_page": 16,
-    "total": 0,
+    "last_page": 50,
+    "total": 5000,
     "has_more": true,
     "next_page": 2
   },
@@ -60,58 +44,36 @@ Every upstream request asks for **100 entries**, the documented production maxim
   },
   "notices": [],
   "source": "NexWall",
-  "environment": "sandbox",
-  "fallback_reason": "missing_api_key"
+  "environment": "production",
+  "fallback_reason": null
 }
 ```
 
-`total` counts this cached selection, not the provider catalog. `notices` preserves page-level rights information, and item metadata preserves attribution. Display applicable rights notices in clients. Preserve `snapshot` throughout pagination. On `410 snapshot_expired`, clear the old selection and restart at page 1. Distinguish offline transport errors from HTTP `503` service/cache errors. Do not silently fall back to NexWall.
+`total` is the provider's reported count when available, otherwise `null`; it is not the number already cached. The `categories` list is a curated set of category IDs and names. It does not claim counts or cover images for categories not fetched. Static, non-premium, non-restricted items are selected; provider rights and attribution fields are preserved. A short or empty `data` array is valid. A `snapshot` identifies a cache generation, **not** a NexWall server-side snapshot: as later pages are fetched on demand, new provider uploads can shift page boundaries. Clients should deduplicate item IDs across pages.
 
-| Status | Typical codes | Client handling |
-| --- | --- | --- |
-| 400 | `invalid_page`, `invalid_query`, `snapshot_required`, `invalid_snapshot` | Correct parameters |
-| 410 | `snapshot_expired` | Restart pagination |
-| 429 | `rate_limited` | Wait for `Retry-After` |
-| 503 | `cache_unavailable`, `cache_expired`, `snapshot_propagating`, `service_error` | Show unavailable state; respect `Retry-After` |
+| Status | Meaning |
+| --- | --- |
+| 400 | Invalid page, category, or query |
+| 410 | The requested generation expired; restart at page 1 |
+| 429 | Per-IP throttling or the upstream attempt budget/quota was reached; respect `Retry-After` |
+| 503 | Missing key, upstream/service failure, or a temporarily unavailable page |
 
-Only `/wallpapers` is public. Native mobile HTTP clients do not require CORS. Browser access can be added with an explicit origin policy when needed.
+The `X-Cache-Status` response header is `miss`, `hit`, or `edge` for operational checks. A first request for a page may take an upstream round trip. The same page is shared by all users while valid. A manually deleted KV page becomes a miss and is fetched again; a 15-second edge copy may briefly remain. Deleting a cache entry can consume a new NexWall request, so use `BLOCKED_WALLPAPER_IDS` for urgent content exclusion instead of deleting cache entries alone.
 
-## Consistency, expiry, budget
+## Quota and expiry
 
-- A named Durable Object serializes scheduled jobs. A persisted slot ID deduplicates cron deliveries and survives restarts; a persisted lease prevents overlap. A crash may skip that refresh window rather than duplicate its traffic.
-- The durable counter reserves an attempt **before** every upstream request. It resets at midnight UTC and caps attempts at 80, including retries and failures. It fails closed when persistence fails. Keep the same coordinator name/binding and storage when redeploying. Sharing the NexWall key with another Worker or service creates uncounted traffic and must be avoided.
-- Every normal job fetches up to 16 pages (`per_page=100&type=image&sort=newest`), stopping at the provider's last page: up to 64 planned calls/day. Each page permits at most one retry for network/JSON errors or HTTP 5xx. Production 401/429 suppress production requests until at least the next UTC day, then restart the selection at sandbox page 1. `Retry-After` can extend cooldown. Sandbox 401/403/429 stops the refresh and starts a separate sandbox cooldown. Production 403 stops the refresh without fallback. Redirects are not followed. All attempts against both sources, including partial production pages discarded before fallback, share the 80/day cap; hitting the local cap does not open another budget.
-- All pages must pass validation before a single immutable KV snapshot is saved. Only then is its reference published atomically in Durable Object storage. A failed page never partially replaces the previous snapshot. A new version may briefly return `snapshot_propagating` at another location while KV propagates.
-- Retention is strictly **six hours from refresh start**, including fetching time. Expiry is checked during every request, independently of storage/cache eviction. A retained prior snapshot is usable for at most ten minutes after publication, and never beyond its original six-hour expiry. With exactly six-hour scheduling, old versions will usually already be expired at rollover. Refresh failure or propagation can create a service gap; there is no stale grace extension.
-- The current manifest and complete snapshot use 15-second internal edge caches to reduce backend reads. Public responses use `no-store` so clients do not unknowingly retain service responses beyond expiry. Pagination of a previous snapshot drops IDs absent from the new selection and uses current URLs/rights for IDs still present. This can shorten a page.
-- A 120/minute per-IP edge rate limit runs before cache reads. Cloudflare rate limit counters are local to a location and approximate; this is abuse mitigation, not an identity or global request budget. Shared mobile-network IPs share that allowance.
+The Durable Object reserves an attempt before each production request, including retries and failures. Its persisted count caps attempts at **80 per UTC day**, leaving margin below NexWall's documented Free-plan 100/day. The count survives Worker restarts and deployments. Two callers requesting the same cold page at once share one in-flight fetch; separate cold pages each use a request. A page retries once only for network/JSON errors or HTTP 5xx. A provider 401, 403, or 429 stops further upstream calls until at least the next UTC day. There is no sandbox fallback after hitting production limits; that would risk evading the provider's quota. If the key is absent, uncached pages return `missing_api_key` without calling the sandbox. Cached pages can still be served.
 
-## Removals and restrictions
+Each browsing generation and its KV pages expire six hours after the first page-1 request. Cache hits do not extend this time. An explicit expired `snapshot` returns 410; a new page-1 request without a snapshot starts a new generation. KV is eventually consistent; a newly written page may briefly be refetched from a different location. The named Durable Object coordinates concurrent misses and makes the quota limit strict. Public responses use `Cache-Control: no-store`; the Worker uses an internal edge copy for at most 15 seconds to reduce backend reads. A 120/minute per-IP limiter protects the app endpoint but is not the upstream quota counter.
 
-Scheduled refreshes detect changed availability; this is not an instantaneous removal feed. For an urgent removal, set `BLOCKED_WALLPAPER_IDS` to comma-separated IDs in `wrangler.jsonc`, increment `POLICY_VERSION`, and deploy. Exclusions run even on cache hits. For broad access restrictions set `SERVICE_ENABLED=false` and deploy. Update the local config too if changing dashboard variables, to avoid undoing the change on a later deployment.
+Six hours is a proposed temporary retention policy, not provider-approved. NexWall's [API documentation](https://nexwall.kodnextech.com/wallpaper-api/docs) documents the 100-item maximum and Free-plan request allowance. Its [license](https://nexwall.kodnextech.com/wallpaper-api/license) permits reasonable temporary caching but prohibits catalog mirroring and quota evasion. This cache is for the app's user-driven browsing, not bulk export. Do not run a crawler against the Worker to fill the full catalog.
 
-Successful refreshes remove missing/restricted IDs from retained-page responses. Upstream 401/403 invalidates the manifest, subject to the existing 15-second manifest edge cache. KV payloads auto-expire within six hours; remove affected snapshot keys from KV as well if immediate physical deletion is required. Do not delete only KV keys and assume all edge copies are purged. Revoke service or apply exclusions first.
+## Content removal and operations
 
-Six hours is a proposed application retention policy, not a provider-approved caching period. NexWall permits reasonable temporary caching but prohibits catalog mirroring, quota evasion and offering its API under another brand. This service is a bounded application backend, not a public replacement for NexWall. See the [NexWall license](https://nexwall.kodnextech.com/wallpaper-api/license) and [API documentation](https://nexwall.kodnextech.com/wallpaper-api/docs). The public sandbox was verified separately to return 20 items per page when requesting 100; the first production refresh must still verify the authenticated response schema. Schema mismatches fail closed and log an error code without exposing response bodies or credentials.
+The Worker filters known restricted, premium, withdrawn, and live items on each upstream fetch. It cannot learn about a later withdrawal until that page is fetched again or expires. For an urgent removal, add IDs to `BLOCKED_WALLPAPER_IDS`, increment `POLICY_VERSION` in `wrangler.jsonc`, and deploy. The block is applied to KV hits before responding. For a broad restriction, set `SERVICE_ENABLED=false` and deploy. Update local config too if changing dashboard variables so later deployments preserve the policy.
 
-## Postgres through Hyperdrive
+Run `npm run check` for TypeScript and Workers-runtime tests. Tests cover concurrent misses, cache hits, deleted-page refill, category filtering, expiry, pagination, quota persistence, retries, provider 429, and rights filtering. Run `npx wrangler tail --format json` or Workers Logs to see `upstream_attempt_reserved`, `page_cached`, `request_error`, and `app_request`. No keys, authorization headers, or provider response bodies are logged. Compare NexWall usage before and after repeated same-page requests: only the cold miss should count. Monitor Worker p50/p95 latency, KV operations, Durable Object activity, and provider quota headers/console.
 
-The driver is `pg`; the Worker enables Node.js compatibility. `src/database.ts` creates a client per invocation using `env.HYPERDRIVE.connectionString`, runs a read-only `SELECT 1 AS ok`, and closes the client. Hyperdrive maintains the underlying pool. No database schema changes or table writes are made.
+## Optional Postgres/Hyperdrive
 
-The account initially had no Hyperdrive configurations. Create one in Cloudflare's **Storage & databases → Hyperdrive** using the direct Postgres endpoint and credentials. Keep the password there. Disable query caching when connection pooling alone is desired. Add the resulting non-secret ID to `wrangler.jsonc`:
-
-```json
-"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "YOUR_HYPERDRIVE_ID" }]
-```
-
-The next scheduled event checks connectivity and logs `database_check` with status and latency. Database failures do not interrupt the independent KV wallpaper service. The binding is optional until the existing database is identified; do not interpret a successful Worker deployment as a verified database connection. For local testing, use a separate development database with `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE` in your private environment, never a tracked config file. See [Cloudflare's pg/Hyperdrive instructions](https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-drivers-and-libraries/node-postgres/).
-
-## Operations and verification
-
-`npm run check` runs TypeScript and Workers-runtime tests covering concurrent cache reads, expiry, pagination, KV propagation, withdrawal filtering, concurrent refresh, restart persistence, day rollover, failed pages, retries, budget exhaustion, redirect handling and upstream access failures.
-
-Use `npx wrangler tail --format json` or Workers Logs to inspect `scheduled_refresh`, `refresh_published`, `refresh_failed`, `database_check`, and `app_request`. No headers, keys, database connection strings or provider bodies are logged. Missing secret, repeated refresh failures, fewer-than-expected item counts and non-200 app response rates warrant investigation. Counters can also be inspected in Durable Object storage through Cloudflare tooling; never clear them to work around quota limits.
-
-Worker Analytics reports request volume, errors and latency. KV Analytics reports reads/writes; Durable Object metrics report calls/storage; Hyperdrive metrics report connections and queries. Internal edge caching reduces backend reads but does not eliminate Worker invocations. Track production p50/p95 latency and daily usage before broad rollout. `Server-Timing` measures Worker handler time; use client timings for network-inclusive latency.
-
-After the first successful refresh, request page 1 repeatedly/concurrently, preserve its version for page 2, and compare NexWall's usage before/after. App reads must add zero NexWall calls. Do not run a high-volume load test against the provider. Flutter builds and device checks are outside this server repository.
+`src/database.ts` can perform a read-only `SELECT 1 AS ok` through a `HYPERDRIVE` binding when the scheduled handler is invoked. No Hyperdrive binding or wallpaper cron is currently configured, so this does not affect the wallpaper cache. To connect the existing Postgres database, create a Hyperdrive configuration in Cloudflare and add its non-secret ID to `wrangler.jsonc` as `"hyperdrive": [{ "binding": "HYPERDRIVE", "id": "YOUR_HYPERDRIVE_ID" }]`. Keep the database password in Cloudflare. See [Cloudflare's Hyperdrive guide](https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-drivers-and-libraries/node-postgres/).
