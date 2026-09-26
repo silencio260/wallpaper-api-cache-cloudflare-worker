@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "wallpaper-cache",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "ee8773347e569248ad48e5052f647b6b",
+  "kv_namespaces": [{ "binding": "WALLPAPER_CACHE", "id": "0a9f6f4259d94dfa956ee5e81ff68d2d" }],
+  "durable_objects": {
+    "bindings": [{ "name": "REFRESH_COORDINATOR", "class_name": "RefreshCoordinator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RefreshCoordinator"] }],
+  "triggers": { "crons": ["0 */6 * * *"] },
+  "ratelimits": [{
+    "name": "APP_RATE_LIMITER",
+    "namespace_id": "1001",
+    "simple": { "limit": 120, "period": 60 }
+  }],
+  "vars": {
+    "SERVICE_ENABLED": "true",
+    "BLOCKED_WALLPAPER_IDS": "",
+    "POLICY_VERSION": "1",
+    "REFRESH_GENERATION": "2"
+  },
+  "observability": { "enabled": true }
+}
