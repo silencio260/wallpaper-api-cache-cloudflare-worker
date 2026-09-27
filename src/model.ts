@@ -16,6 +16,7 @@ export interface CachedPage {
   expiresAt: number;
   page: number;
   categoryId: number | null;
+  search?: string | null;
   items: Wallpaper[];
   notices: Record<string, unknown>;
   pageSize: number;

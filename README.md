@@ -17,9 +17,14 @@ GET /wallpapers?page=1
 GET /wallpapers?page=2&snapshot=<version-from-page-1>
 GET /wallpapers?page=1&category_id=13
 GET /wallpapers?page=2&category_id=13&snapshot=<category-version>
+GET /wallpapers?page=1&search=anime
+GET /wallpapers?page=2&search=anime&snapshot=<search-version>
+GET /categories
 ```
 
-A page-1 request starts or reuses a six-hour browsing generation for that category or the unfiltered feed. Later pages require its `snapshot` UUID. A different category has a separate generation; start it at page 1 without carrying the old category's snapshot. The Worker forwards `page`, `category_id` when present, `per_page=100`, `type=image`, and `sort=newest` to NexWall only on a cache miss. The provider's reported `last_page` and `per_page` drive pagination. There is no five-page or sixteen-page feed cap. `pagination.next_page` is `null` at the end. Unknown, duplicate, or malformed parameters are rejected. The response includes only metadata and hosted image URLs, never image files or the API key.
+A page-1 request starts or reuses a six-hour browsing generation for that category or the unfiltered feed. Later pages require its `snapshot` UUID. A different category has a separate generation; start it at page 1 without carrying the old category's snapshot. The Worker forwards `page`, `category_id` when present, `per_page=100`, `type=image`, and `sort=newest` to NexWall only on a cache miss. `/categories` returns IDs and names available to the configured NexWall plan. The shared upstream response is cached for six hours; a cache fill counts against the same daily request budget. The provider's reported `last_page` and `per_page` drive pagination. There is no five-page or sixteen-page feed cap. `pagination.next_page` is `null` at the end. Unknown, duplicate, or malformed parameters are rejected. The response includes only metadata and hosted image URLs, never image files or the API key.
+
+`search` accepts exactly these lowercase words: `gaming`, `anime`, `dark`, `dope`, `space`. Search and `category_id` cannot be combined. Each search term has its own cached pages and snapshot; carry that term and its returned `snapshot` through pagination. An uncached search page spends one upstream attempt under the same shared daily cap.
 
 ```json
 {

@@ -12,10 +12,16 @@ interface importEnv extends Env {}
 const stub = () => env.REFRESH_COORDINATOR.get(env.REFRESH_COORDINATOR.idFromName(COORDINATOR_NAME));
 const item = (id: number) => ({ id, image_url: `https://images.example/${id}.webp`, thumbnail_url: `https://images.example/${id}-thumb.webp`, type: 'static', is_premium: false, attribution: 'Provider artist' });
 const pageBody = (page: number, lastPage = 50) => ({ data: [item(page)], current_page: page, last_page: lastPage, per_page: 100, total: lastPage });
-const expected: { page: number; categoryId: number | null; status: number; body: unknown }[] = [];
+const expected: { page: number; categoryId: number | null; search: string | null; status: number; body: unknown }[] = [];
 let calls = 0;
-function upstream(page: number, status = 200, body: unknown = pageBody(page), categoryId: number | null = null) {
-  expected.push({ page, categoryId, status, body });
+function upstream(page: number, status = 200, body: unknown = pageBody(page), categoryId: number | null = null, search: string | null = null) {
+  expected.push({ page, categoryId, search, status, body });
+}
+async function categoriesRequest() {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(new Request('https://app.example/categories'), env, ctx);
+  await waitOnExecutionContext(ctx);
+  return response;
 }
 async function request(query = '', overrides: Partial<Env> = {}) {
   const ctx = createExecutionContext();
@@ -34,6 +40,7 @@ beforeEach(() => {
     expect(url.searchParams.get('per_page')).toBe('100');
     expect(url.searchParams.get('type')).toBe('image');
     expect(url.searchParams.get('category_id')).toBe(next!.categoryId === null ? null : String(next!.categoryId));
+    expect(url.searchParams.get('search')).toBe(next!.search);
     expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-secret-not-a-real-key');
     expect(init?.redirect).toBe('manual');
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -45,6 +52,20 @@ afterEach(async () => {
   vi.restoreAllMocks(); expected.length = 0; calls = 0;
   await reset();
   expect(remaining).toBe(0);
+});
+
+describe('category catalog', () => {
+  it('uses one shared production category request and returns plan-available IDs', async () => {
+    vi.mocked(globalThis.fetch).mockImplementationOnce(async (input, init) => {
+      expect(String(input)).toBe('https://nexwall.kodnextech.com/api/developer/v1/categories');
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer test-secret-not-a-real-key');
+      return Response.json({ data: [{ id: 4, name: 'Animals & Wildlife' }, { id: 50, name: 'Sports' }] });
+    });
+    const first = await categoriesRequest();
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ data: [{ id: 4, name: 'Animals & Wildlife' }, { id: 50, name: 'Sports' }] });
+    expect(await (await categoriesRequest()).json()).toEqual({ data: [{ id: 4, name: 'Animals & Wildlife' }, { id: 50, name: 'Sports' }] });
+  });
 });
 
 describe('on-demand cache', () => {
@@ -85,6 +106,28 @@ describe('on-demand cache', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ selected_category_id: 13, pagination: { last_page: 3 } });
   });
+  it('caches Gaming search separately and forwards it on every page', async () => {
+    upstream(1, 200, pageBody(1, 2), null, 'gaming');
+    upstream(2, 200, pageBody(2, 2), null, 'gaming');
+    const first = await request('?search=gaming');
+    expect(first.status).toBe(200);
+    const body = await first.json() as { snapshot: string; selected_search: string };
+    expect(body.selected_search).toBe('gaming');
+    const second = await request(`?search=gaming&page=2&snapshot=${body.snapshot}`);
+    expect(second.status).toBe(200);
+    expect((await second.json() as { selected_search: string }).selected_search).toBe('gaming');
+    expect((await request('?search=gaming')).status).toBe(200);
+    expect(calls).toBe(2);
+    expect((await request(`?page=2&snapshot=${body.snapshot}`)).status).toBe(410);
+  });
+  it.each(['anime', 'dark', 'dope', 'space'])('accepts exact lowercase search %s', async term => {
+    upstream(1, 200, pageBody(1, 1), null, term);
+    const response = await request(`?search=${term}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ selected_search: term, data: [item(1)],
+      pagination: { next_page: null } });
+    expect(calls).toBe(1);
+  });
   it('only advertises free categories observed in the returned page', async () => {
     upstream(1, 200, { ...pageBody(1, 1), data: [{ ...item(1), categories: [
       { id: 13, name: 'Nature & Landscapes', is_premium: false },
@@ -99,7 +142,7 @@ describe('on-demand cache', () => {
     expect(body).toMatchObject({ pagination: { next_page: null, has_more: false } });
     expect((await request('?page=2&snapshot=' + (body as { snapshot: string }).snapshot)).status).toBe(400);
   });
-  it.each(['?page=0', '?page=1.5', '?page=01', '?page=1&page=2', '?search=cat', '?page=2', '?snapshot=invalid', '?category_id=0'])('rejects invalid query %s', async query => {
+  it.each(['?page=0', '?page=1.5', '?page=01', '?page=1&page=2', '?search=cat', '?page=2', '?snapshot=invalid', '?category_id=0', '?category_id=13&search=gaming', '?search=Gaming', '?search=Anime', '?search=dark%20', '?search=SPACE'])('rejects invalid query %s', async query => {
     expect((await request(query)).status).toBe(400);
   });
   it('returns 410 for an expired selection and starts a new one from page 1', async () => {
